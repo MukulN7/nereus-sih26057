@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Large dataset
+data/
+
+# Generated outputs
+outputs/
+runs/
+
+# Local/cache files
+.cache/
+*.cache
+
+# IDE / local agent files
+.agents/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
