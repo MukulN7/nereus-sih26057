@@ -23,7 +23,8 @@ from ultralytics import YOLO
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
 MODEL_PATH = PROJECT_ROOT / "models" / "best.pt"
-SAMPLE_DIR = PROJECT_ROOT / "data" / "images" / "test"
+SAMPLE_DIR = PROJECT_ROOT / "sample_data"
+FALLBACK_SAMPLE_DIR = PROJECT_ROOT / "data" / "images" / "test"
 
 # Page setup with professional sans-serif styling
 st.set_page_config(
@@ -63,6 +64,15 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+def get_active_sample_dir() -> Path:
+    """Returns the sample data directory, preferring sample_data/ for deployment."""
+    if SAMPLE_DIR.exists() and any(SAMPLE_DIR.iterdir()):
+        return SAMPLE_DIR
+    if FALLBACK_SAMPLE_DIR.exists() and any(FALLBACK_SAMPLE_DIR.iterdir()):
+        return FALLBACK_SAMPLE_DIR
+    return SAMPLE_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -189,14 +199,16 @@ def main():
         index=0,
     )
 
-    # Collect available sample test images
+    # Collect available sample test images from active sample directory
+    active_sample_dir = get_active_sample_dir()
     sample_options = []
-    if SAMPLE_DIR.exists():
+    if active_sample_dir.exists():
         sample_options = sorted(
-            [p.name for p in SAMPLE_DIR.glob("*.pbm")] +
-            [p.name for p in SAMPLE_DIR.glob("*.bpm")] +
-            [p.name for p in SAMPLE_DIR.glob("*.jpg")] +
-            [p.name for p in SAMPLE_DIR.glob("*.png")]
+            [p.name for p in active_sample_dir.glob("*.jpg")] +
+            [p.name for p in active_sample_dir.glob("*.pbm")] +
+            [p.name for p in active_sample_dir.glob("*.bpm")] +
+            [p.name for p in active_sample_dir.glob("*.png")] +
+            [p.name for p in active_sample_dir.glob("*.jpeg")]
         )
 
     active_filename = ""
@@ -204,7 +216,7 @@ def main():
 
     if input_mode == "Sample Test Image":
         if not sample_options:
-            st.sidebar.warning("No sample images found in test directory.")
+            st.sidebar.warning("No sample images found in sample directory.")
             return
 
         selected_sample = st.sidebar.selectbox(
@@ -213,7 +225,7 @@ def main():
             index=0,
         )
         active_filename = selected_sample
-        sample_file_path = SAMPLE_DIR / selected_sample
+        sample_file_path = active_sample_dir / selected_sample
         if sample_file_path.exists():
             raw_bytes = sample_file_path.read_bytes()
 
