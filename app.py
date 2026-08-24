@@ -4,13 +4,20 @@ Operational Screening & Inspection Dashboard
 
 This dashboard provides an operational interface for Side-Scan Sonar (SSS) imagery:
 1. Single Image Mode: Inspect and analyze individual sonar frames with dual-view visualization.
-2. Survey Folder Mode: Automated batch screening of entire sonar survey directories, anomaly ranking,
-   targeted flagged-frame review, and consolidated JSON/CSV survey report generation.
+2. Survey Folder Mode: Automated batch screening of entire sonar survey directories (Sample Surveys
+   or Custom Uploads), anomaly ranking, targeted flagged-frame review, and consolidated JSON/CSV survey report generation.
+
+Session-State Design (Survey Mode):
+- All raw detections (at conf=0.0) are stored in session_state as lightweight JSON-serializable dicts.
+- Image pixel data is NEVER stored in session_state.
+- The confidence threshold re-filters stored detections without re-running inference.
+- For sample surveys, images are re-read from disk paths stored in session_state.
+- For custom-upload surveys, uploaded file objects remain in Streamlit's widget state for the
+  session lifetime; bytes are fetched on-demand only when the user inspects a flagged image.
 """
 
 import io
 import json
-import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +35,7 @@ from ultralytics import YOLO
 PROJECT_ROOT = Path(__file__).resolve().parent
 MODEL_PATH = PROJECT_ROOT / "models" / "best.pt"
 SAMPLE_DIR = PROJECT_ROOT / "sample_data"
+SAMPLE_SURVEYS_DIR = PROJECT_ROOT / "sample_surveys"
 FALLBACK_SAMPLE_DIR = PROJECT_ROOT / "data" / "images" / "test"
 
 SUPPORTED_EXTENSIONS = {".pbm", ".bpm", ".ppm", ".jpg", ".jpeg", ".png", ".bmp"}
@@ -89,6 +97,16 @@ st.markdown(
 )
 
 
+class LocalSurveyFile:
+    """Wrapper to unify local on-disk files with Streamlit UploadedFile in batch screening."""
+    def __init__(self, path: Path):
+        self.name = path.name
+        self.path = path
+
+    def getvalue(self) -> bytes:
+        return self.path.read_bytes()
+
+
 def get_active_sample_dir() -> Path:
     """Returns the sample data directory, preferring sample_data/ for deployment."""
     if SAMPLE_DIR.exists() and any(SAMPLE_DIR.iterdir()):
@@ -96,6 +114,17 @@ def get_active_sample_dir() -> Path:
     if FALLBACK_SAMPLE_DIR.exists() and any(FALLBACK_SAMPLE_DIR.iterdir()):
         return FALLBACK_SAMPLE_DIR
     return SAMPLE_DIR
+
+
+def get_available_sample_surveys() -> Dict[str, Path]:
+    """Discovers available sample survey directories in sample_surveys/."""
+    surveys = {}
+    if SAMPLE_SURVEYS_DIR.exists():
+        for item in sorted(SAMPLE_SURVEYS_DIR.iterdir()):
+            if item.is_dir():
+                readable_name = item.name.replace("_", " ").title()
+                surveys[readable_name] = item
+    return surveys
 
 
 # ---------------------------------------------------------------------------
@@ -136,14 +165,16 @@ def decode_sonar_bytes(file_bytes: bytes) -> Optional[np.ndarray]:
 # ---------------------------------------------------------------------------
 # Core Inference Helpers
 # ---------------------------------------------------------------------------
-def extract_detections(result, conf_threshold: float) -> List[Dict[str, Any]]:
-    """Extracts structured bounding box and confidence records from YOLO prediction."""
+def extract_detections_raw(result) -> List[Dict[str, Any]]:
+    """
+    Extracts ALL bounding box records from a YOLO result at conf=0.0.
+    This stores the complete unfiltered detection set so threshold changes
+    can re-filter from stored data without re-running inference.
+    """
     detections = []
     if result.boxes is not None and len(result.boxes) > 0:
         for i in range(len(result.boxes)):
             conf = float(result.boxes.conf[i].item())
-            if conf < conf_threshold:
-                continue
             x1, y1, x2, y2 = result.boxes.xyxy[i].tolist()
             detections.append(
                 {
@@ -161,6 +192,16 @@ def extract_detections(result, conf_threshold: float) -> List[Dict[str, Any]]:
                 }
             )
     return detections
+
+
+def filter_detections(raw_detections: List[Dict[str, Any]], conf_threshold: float) -> List[Dict[str, Any]]:
+    """Filters a pre-stored raw detections list to those meeting the confidence threshold."""
+    return [d for d in raw_detections if d["confidence"] >= conf_threshold]
+
+
+def extract_detections(result, conf_threshold: float) -> List[Dict[str, Any]]:
+    """Extracts structured bounding box and confidence records from YOLO prediction."""
+    return filter_detections(extract_detections_raw(result), conf_threshold)
 
 
 def run_nereus_inference(
@@ -189,6 +230,37 @@ def run_nereus_inference(
     detections = extract_detections(result, conf_threshold)
 
     return annotated_rgb, detections
+
+
+def _get_image_bytes_for_review(
+    filename: str,
+    survey_source: str,
+    sample_dir_str: str,
+    uploaded_files: Optional[List[Any]],
+) -> Optional[bytes]:
+    """
+    Resolves raw image bytes for a specific filename at review time.
+    - For sample surveys: re-reads from disk (path stored as string in session_state).
+    - For custom uploads: fetches from the Streamlit uploaded file objects still in widget state.
+    Image bytes are never persisted in session_state.
+    """
+    if survey_source == "sample":
+        disk_path = Path(sample_dir_str) / filename
+        if disk_path.exists():
+            try:
+                return disk_path.read_bytes()
+            except Exception:
+                return None
+    else:
+        # For custom uploads, find the matching file object from the widget
+        if uploaded_files:
+            for f in uploaded_files:
+                if f.name == filename:
+                    try:
+                        return f.getvalue()
+                    except Exception:
+                        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +323,6 @@ def build_consolidated_json(
     errors_data: List[Dict[str, Any]],
 ) -> bytes:
     """Generates structured consolidated JSON report for the complete survey."""
-    # Clean images list to strictly match the standardized JSON schema
     schema_images = []
     for item in images_data:
         schema_images.append(
@@ -273,15 +344,20 @@ def build_consolidated_json(
 def build_flagged_images_zip(
     model: YOLO,
     flagged_images: List[Dict[str, Any]],
-    file_bytes_map: Dict[str, bytes],
+    survey_source: str,
+    sample_dir_str: str,
+    uploaded_files: Optional[List[Any]],
     conf_threshold: float,
 ) -> bytes:
-    """Generates an in-memory ZIP archive containing annotated images of all flagged anomalies."""
+    """
+    Generates an in-memory ZIP archive of annotated flagged images.
+    Image bytes are fetched on-demand from disk or upload widget — never from session_state.
+    """
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for item in flagged_images:
             filename = item["image_filename"]
-            raw_bytes = file_bytes_map.get(filename)
+            raw_bytes = _get_image_bytes_for_review(filename, survey_source, sample_dir_str, uploaded_files)
             if raw_bytes is None:
                 continue
 
@@ -302,6 +378,65 @@ def build_flagged_images_zip(
 
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Survey results with live threshold re-filtering (no image bytes in state)
+# ---------------------------------------------------------------------------
+def _apply_threshold_to_survey(all_image_records: List[Dict], conf_threshold: float, errors: List[Dict], survey_id: str) -> Dict[str, Any]:
+    """
+    Re-filters stored raw detections for every image using the current threshold.
+    Returns a fully recomputed survey view — no inference re-run needed.
+    """
+    processed_images = []
+    flagged_images = []
+    total_detections_count = 0
+
+    for record in all_image_records:
+        raw_dets = record.get("all_detections", [])
+        detections = filter_detections(raw_dets, conf_threshold)
+        num_dets = len(detections)
+        total_detections_count += num_dets
+        highest_conf = max([d["confidence"] for d in detections]) if num_dets > 0 else 0.0
+
+        img_record = {
+            "image_filename": record["image_filename"],
+            "detection_count": num_dets,
+            "detections": detections,
+            "highest_confidence": highest_conf,
+        }
+        processed_images.append(img_record)
+        if num_dets > 0:
+            flagged_images.append(img_record)
+
+    num_processed = len(processed_images)
+    num_with_anomalies = len(flagged_images)
+    num_skipped = len(errors)
+    total_files = num_processed + num_skipped
+
+    all_confs = [d["confidence"] for img in processed_images for d in img["detections"]]
+    highest_survey_conf = max(all_confs) if all_confs else 0.0
+    avg_survey_conf = sum(all_confs) / len(all_confs) if all_confs else 0.0
+
+    survey_summary = {
+        "total_images": total_files,
+        "processed_images": num_processed,
+        "images_with_anomalies": num_with_anomalies,
+        "images_without_anomalies": num_processed - num_with_anomalies,
+        "skipped_images": num_skipped,
+        "total_detections": total_detections_count,
+        "confidence_threshold": conf_threshold,
+        "highest_confidence": round(highest_survey_conf, 4),
+        "average_confidence": round(avg_survey_conf, 4),
+    }
+
+    return {
+        "survey_id": survey_id,
+        "survey_summary": survey_summary,
+        "processed_images": processed_images,
+        "flagged_images": flagged_images,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -498,8 +633,24 @@ def render_single_image_mode(model: YOLO):
 # Workflow: Survey Folder Mode (Batch Screening)
 # ---------------------------------------------------------------------------
 def render_survey_folder_mode(model: YOLO):
-    """Renders the automated survey directory batch screening workflow."""
+    """
+    Renders the automated survey directory batch screening workflow.
+
+    Session-state key: "survey_run"
+    Contents (all lightweight, no image bytes):
+      - survey_id: str
+      - all_image_records: list of {image_filename, all_detections (unfiltered)}
+      - errors: list of error dicts
+      - survey_source: "sample" or "custom"
+      - sample_dir_str: str path (sample surveys only)
+    """
     st.sidebar.markdown("### Controls")
+
+    survey_source_label = st.sidebar.radio(
+        "Survey Source",
+        options=["Sample Survey", "Upload Custom Survey"],
+        index=0,
+    )
 
     conf_threshold = st.sidebar.slider(
         "Confidence Threshold",
@@ -511,25 +662,59 @@ def render_survey_folder_mode(model: YOLO):
 
     st.markdown('<div class="section-title">Survey Ingestion</div>', unsafe_allow_html=True)
     st.markdown(
-        "Upload a folder of Side-Scan Sonar images. Nereus will automatically screen all images, "
+        "Screen an entire Side-Scan Sonar survey directory. Nereus will automatically process all images, "
         "rank detected anomalies, and prepare consolidated inspection reports."
     )
 
-    uploaded_files = st.file_uploader(
-        "Select Survey Folder",
-        accept_multiple_files="directory",
-        type=["pbm", "bpm", "ppm", "jpg", "jpeg", "png", "bmp"],
-        help="Select a directory containing sonar images to screen.",
-    )
+    # Resolve the list of survey files and the source tag
+    survey_files: List[Any] = []
+    survey_source: str = ""
+    sample_dir_str: str = ""
+    uploaded_files: Optional[List[Any]] = None
 
-    if not uploaded_files:
-        st.info("Select a sonar survey directory using the upload area above to begin batch screening.")
+    if survey_source_label == "Sample Survey":
+        available_surveys = get_available_sample_surveys()
+        if not available_surveys:
+            st.warning("No sample surveys found in sample_surveys/ directory.")
+            return
+
+        survey_options = list(available_surveys.keys())
+        selected_survey_title = st.selectbox(
+            "Select Sample Survey",
+            options=survey_options,
+            index=0,
+        )
+        selected_dir = available_surveys[selected_survey_title]
+        raw_paths = sorted(
+            [p for p in selected_dir.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
+        )
+        survey_files = [LocalSurveyFile(p) for p in raw_paths]
+        survey_source = "sample"
+        sample_dir_str = str(selected_dir)
+
+    else:
+        uploaded_files = st.file_uploader(
+            "Select Survey Folder",
+            accept_multiple_files="directory",
+            type=["pbm", "bpm", "ppm", "jpg", "jpeg", "png", "bmp"],
+            help="Select a directory containing sonar images to screen.",
+        )
+        if uploaded_files:
+            survey_files = uploaded_files
+        survey_source = "custom"
+
+    if not survey_files:
+        if survey_source_label == "Upload Custom Survey":
+            st.info("Select a sonar survey directory using the upload area above to begin batch screening.")
+        else:
+            st.info("Select a sample survey from the options above to begin batch screening.")
+        # Clear stale results if the source changed or files removed
+        st.session_state.pop("survey_run", None)
         return
 
-    total_files = len(uploaded_files)
+    total_files = len(survey_files)
     st.write(f"Discovered **{total_files}** file(s) for survey screening.")
 
-    # Survey run button
     btn_analyze = st.button("Analyze Survey", type="primary")
 
     if btn_analyze:
@@ -538,22 +723,19 @@ def render_survey_folder_mode(model: YOLO):
         progress_bar = st.progress(0.0)
         status_placeholder = st.empty()
 
-        processed_images = []
-        errors = []
-        flagged_images = []
-        file_bytes_map = {}
-        total_detections_count = 0
+        # all_image_records stores UNFILTERED raw detections per image (no image bytes)
+        all_image_records: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        total_raw_dets = 0
 
-        # Sequential low-memory batch screening
-        for idx, file_obj in enumerate(uploaded_files):
+        for idx, file_obj in enumerate(survey_files):
             filename = file_obj.name
             ext = Path(filename).suffix.lower()
 
             status_placeholder.text(
-                f"Processing: {idx + 1} / {total_files} | Anomalies Found: {total_detections_count} | Current: {filename}"
+                f"Processing: {idx + 1} / {total_files} | Raw detections so far: {total_raw_dets} | Current: {filename}"
             )
 
-            # Validate extension
             if ext not in SUPPORTED_EXTENSIONS:
                 errors.append(
                     {
@@ -568,114 +750,83 @@ def render_survey_folder_mode(model: YOLO):
                 file_bytes = file_obj.getvalue()
                 img_bgr = decode_sonar_bytes(file_bytes)
             except Exception as read_err:
-                errors.append(
-                    {
-                        "image_filename": filename,
-                        "error": f"Read/decode error: {read_err}",
-                    }
-                )
+                errors.append({"image_filename": filename, "error": f"Read/decode error: {read_err}"})
                 progress_bar.progress((idx + 1) / total_files)
                 continue
 
             if img_bgr is None:
-                errors.append(
-                    {
-                        "image_filename": filename,
-                        "error": "Failed to decode image bytes into valid sonar array.",
-                    }
-                )
+                errors.append({"image_filename": filename, "error": "Failed to decode image bytes."})
                 progress_bar.progress((idx + 1) / total_files)
                 continue
 
             try:
-                results = model.predict(
-                    source=img_bgr,
-                    conf=conf_threshold,
-                    device="cpu",
-                    verbose=False,
-                )
+                # Run inference at very low conf (0.01) to capture all raw candidates.
+                # We store ALL detections and re-filter per threshold later without re-running inference.
+                results = model.predict(source=img_bgr, conf=0.01, device="cpu", verbose=False)
                 result = results[0]
-                detections = extract_detections(result, conf_threshold)
+                raw_dets = extract_detections_raw(result)
             except Exception as inf_err:
-                errors.append(
-                    {
-                        "image_filename": filename,
-                        "error": f"Inference execution failure: {inf_err}",
-                    }
-                )
+                errors.append({"image_filename": filename, "error": f"Inference failure: {inf_err}"})
                 progress_bar.progress((idx + 1) / total_files)
                 continue
 
-            num_dets = len(detections)
-            total_detections_count += num_dets
-            highest_conf = max([d["confidence"] for d in detections]) if num_dets > 0 else 0.0
+            total_raw_dets += len(raw_dets)
+            all_image_records.append(
+                {
+                    "image_filename": filename,
+                    "all_detections": raw_dets,   # lightweight JSON-serializable list
+                }
+            )
 
-            img_record = {
-                "image_filename": filename,
-                "detection_count": num_dets,
-                "detections": detections,
-                "highest_confidence": highest_conf,
-            }
-            processed_images.append(img_record)
-
-            if num_dets > 0:
-                flagged_images.append(img_record)
-                file_bytes_map[filename] = file_bytes
+            # Explicitly delete the large image array immediately
+            del img_bgr
 
             progress_bar.progress((idx + 1) / total_files)
 
         status_placeholder.text(
-            f"Screening complete: {len(processed_images)} processed, {len(flagged_images)} flagged with anomalies, {len(errors)} skipped/errors."
+            f"Screening complete: {len(all_image_records)} processed, {len(errors)} skipped/errors."
         )
 
-        num_processed = len(processed_images)
-        num_with_anomalies = len(flagged_images)
-        num_without_anomalies = num_processed - num_with_anomalies
-        num_skipped = len(errors)
-
-        all_confs = [
-            d["confidence"]
-            for img in processed_images
-            for d in img["detections"]
-        ]
-        highest_survey_conf = max(all_confs) if all_confs else 0.0
-        avg_survey_conf = sum(all_confs) / len(all_confs) if all_confs else 0.0
-
-        survey_summary = {
-            "total_images": total_files,
-            "processed_images": num_processed,
-            "images_with_anomalies": num_with_anomalies,
-            "images_without_anomalies": num_without_anomalies,
-            "skipped_images": num_skipped,
-            "total_detections": total_detections_count,
-            "confidence_threshold": conf_threshold,
-            "highest_confidence": round(highest_survey_conf, 4),
-            "average_confidence": round(avg_survey_conf, 4),
-        }
-
-        # Store survey state
-        st.session_state["survey_results"] = {
+        # Store only lightweight metadata — no image bytes
+        st.session_state["survey_run"] = {
             "survey_id": survey_id,
-            "survey_summary": survey_summary,
-            "processed_images": processed_images,
-            "flagged_images": flagged_images,
+            "all_image_records": all_image_records,
             "errors": errors,
-            "file_bytes_map": file_bytes_map,
-            "conf_threshold": conf_threshold,
+            "survey_source": survey_source,
+            "sample_dir_str": sample_dir_str,
         }
 
-    # Render survey results from session state if available
-    survey_data = st.session_state.get("survey_results")
-    if survey_data is None:
+    # -----------------------------------------------------------------------
+    # Render results from session_state — threshold re-filtering happens here
+    # on every rerun (e.g. slider change) at zero inference cost.
+    # -----------------------------------------------------------------------
+    run_state = st.session_state.get("survey_run")
+    if run_state is None:
         return
 
-    summary = survey_data["survey_summary"]
-    flagged_images = survey_data["flagged_images"]
-    processed_images = survey_data["processed_images"]
-    errors = survey_data["errors"]
-    file_bytes_map = survey_data["file_bytes_map"]
-    active_conf = survey_data["conf_threshold"]
-    survey_id = survey_data["survey_id"]
+    # Check that the stored source matches the current source selection;
+    # if the user switched sources, clear results rather than showing stale data.
+    if run_state.get("survey_source") != survey_source:
+        st.session_state.pop("survey_run", None)
+        st.info("Survey source changed. Run 'Analyze Survey' to screen the new selection.")
+        return
+
+    # Re-filter detections using the current slider value (instant, no inference)
+    view = _apply_threshold_to_survey(
+        all_image_records=run_state["all_image_records"],
+        conf_threshold=conf_threshold,
+        errors=run_state["errors"],
+        survey_id=run_state["survey_id"],
+    )
+
+    summary = view["survey_summary"]
+    processed_images = view["processed_images"]
+    flagged_images = view["flagged_images"]
+    errors = view["errors"]
+    survey_id = view["survey_id"]
+    # Restore source info for on-demand image reading
+    stored_sample_dir_str = run_state.get("sample_dir_str", "")
+    stored_source = run_state.get("survey_source", "")
 
     st.markdown("---")
     st.markdown('<div class="section-title">Survey Summary</div>', unsafe_allow_html=True)
@@ -735,10 +886,13 @@ def render_survey_folder_mode(model: YOLO):
         df_flagged = df_flagged.sort_values(by="_conf_sort", ascending=False).drop(columns=["_conf_sort"])
         st.dataframe(df_flagged, use_container_width=True, hide_index=True)
 
-    # Flagged Image Inspection
+    # Flagged Image Inspection — image bytes fetched on-demand, not from session_state
     if flagged_images:
         st.markdown('<div class="section-title">Flagged Image Review</div>', unsafe_allow_html=True)
-        flagged_names = [row["image_filename"] for row in sorted(flagged_images, key=lambda x: x["highest_confidence"], reverse=True)]
+        flagged_names = [
+            row["image_filename"]
+            for row in sorted(flagged_images, key=lambda x: x["highest_confidence"], reverse=True)
+        ]
 
         selected_image_name = st.selectbox(
             "Select Flagged Image to Inspect",
@@ -746,8 +900,15 @@ def render_survey_folder_mode(model: YOLO):
             index=0,
         )
 
-        selected_bytes = file_bytes_map.get(selected_image_name)
-        if selected_bytes:
+        # Fetch bytes on demand — never stored in session_state
+        selected_bytes = _get_image_bytes_for_review(
+            filename=selected_image_name,
+            survey_source=stored_source,
+            sample_dir_str=stored_sample_dir_str,
+            uploaded_files=uploaded_files,
+        )
+
+        if selected_bytes is not None:
             img_bgr = decode_sonar_bytes(selected_bytes)
             if img_bgr is not None:
                 h, w, _ = img_bgr.shape
@@ -755,7 +916,7 @@ def render_survey_folder_mode(model: YOLO):
                 annotated_rgb, target_dets = run_nereus_inference(
                     model=model,
                     img_bgr=img_bgr,
-                    conf_threshold=active_conf,
+                    conf_threshold=conf_threshold,
                 )
 
                 col_rev_left, col_rev_right = st.columns(2)
@@ -764,7 +925,7 @@ def render_survey_folder_mode(model: YOLO):
                     st.image(orig_rgb, use_container_width=True)
 
                 with col_rev_right:
-                    st.markdown(f"**Nereus Detection Result** (Threshold: {int(active_conf * 100)}%)")
+                    st.markdown(f"**Nereus Detection Result** (Threshold: {int(conf_threshold * 100)}%)")
                     st.image(annotated_rgb, use_container_width=True)
 
                 if target_dets:
@@ -781,6 +942,12 @@ def render_survey_folder_mode(model: YOLO):
                             }
                         )
                     st.dataframe(pd.DataFrame(det_rows), use_container_width=True, hide_index=True)
+        else:
+            if stored_source == "custom":
+                st.info(
+                    f"Image '{selected_image_name}' is no longer available from the upload widget. "
+                    "Re-upload the survey folder and run 'Analyze Survey' again to restore full inspection."
+                )
 
     # Consolidated Survey Reports
     st.markdown('<div class="section-title">Consolidated Survey Reports</div>', unsafe_allow_html=True)
@@ -810,7 +977,14 @@ def render_survey_folder_mode(model: YOLO):
 
     with col_down_zip:
         if flagged_images:
-            zip_bytes = build_flagged_images_zip(model, flagged_images, file_bytes_map, active_conf)
+            zip_bytes = build_flagged_images_zip(
+                model=model,
+                flagged_images=flagged_images,
+                survey_source=stored_source,
+                sample_dir_str=stored_sample_dir_str,
+                uploaded_files=uploaded_files,
+                conf_threshold=conf_threshold,
+            )
             st.download_button(
                 label="Download Flagged Images (ZIP)",
                 data=zip_bytes,

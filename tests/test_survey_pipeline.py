@@ -1,5 +1,10 @@
 """
 Automated unit and integration test suite for Nereus Survey Screening & Single Image pipeline.
+
+Updated for the session-state-safe architecture:
+- No image bytes stored in session_state
+- Raw detections stored at inference time; filtered per threshold
+- ZIP export uses on-demand disk reads or LocalSurveyFile wrappers
 """
 
 import io
@@ -18,11 +23,17 @@ import pandas as pd
 
 from app import (
     MODEL_PATH,
+    SAMPLE_SURVEYS_DIR,
     SUPPORTED_EXTENSIONS,
+    LocalSurveyFile,
+    get_available_sample_surveys,
     load_detection_model,
     decode_sonar_bytes,
     run_nereus_inference,
     extract_detections,
+    extract_detections_raw,
+    filter_detections,
+    _apply_threshold_to_survey,
     build_consolidated_csv,
     build_consolidated_json,
     build_flagged_images_zip,
@@ -82,44 +93,89 @@ def test_single_image_inference_and_anomaly_naming():
 
 
 def test_threshold_filtering():
-    """TEST 4: Verify that high confidence threshold filters out lower confidence detections."""
+    """TEST 4: Verify that high confidence threshold filters stored raw detections correctly."""
     model = load_detection_model(str(MODEL_PATH))
     # Chunk3_LF_1693574479.03.jpg has detections around 0.43, 0.33, 0.32
     target_img_path = Path("sample_data") / "Chunk3_LF_1693574479.03.jpg"
     img_bgr = cv2.imread(str(target_img_path))
 
-    # Low threshold: 0.25 -> 3 detections
-    _, dets_low = run_nereus_inference(model, img_bgr, conf_threshold=0.25)
-    # High threshold: 0.50 -> 0 detections
-    _, dets_high = run_nereus_inference(model, img_bgr, conf_threshold=0.50)
+    # Simulate new pipeline: extract raw at low conf, then filter
+    results = model.predict(source=img_bgr, conf=0.01, device="cpu", verbose=False)
+    raw_dets = extract_detections_raw(results[0])
+
+    dets_low = filter_detections(raw_dets, 0.25)
+    dets_high = filter_detections(raw_dets, 0.50)
 
     assert len(dets_low) >= 2
     assert len(dets_high) < len(dets_low)
 
+    # Slider change simulation: re-filter from stored raw_dets at a third threshold
+    dets_mid = filter_detections(raw_dets, 0.35)
+    assert len(dets_mid) <= len(dets_low)
+
+    # Verify all returned dets meet threshold
+    for d in dets_low:
+        assert d["confidence"] >= 0.25
+    for d in dets_high:
+        assert d["confidence"] >= 0.50
+
+
+def test_apply_threshold_to_survey():
+    """TEST 3 & threshold recompute: verify _apply_threshold_to_survey re-filters correctly."""
+    all_image_records = [
+        {
+            "image_filename": "img_a.jpg",
+            "all_detections": [
+                {"class_name": "Man-Made Anomaly", "confidence": 0.60, "confidence_percent": 60.0, "bbox": {"x1": 0, "y1": 0, "x2": 10, "y2": 10, "width": 10, "height": 10}},
+                {"class_name": "Man-Made Anomaly", "confidence": 0.30, "confidence_percent": 30.0, "bbox": {"x1": 0, "y1": 0, "x2": 5, "y2": 5, "width": 5, "height": 5}},
+            ],
+        },
+        {
+            "image_filename": "img_b.jpg",
+            "all_detections": [
+                {"class_name": "Man-Made Anomaly", "confidence": 0.20, "confidence_percent": 20.0, "bbox": {"x1": 0, "y1": 0, "x2": 3, "y2": 3, "width": 3, "height": 3}},
+            ],
+        },
+    ]
+    errors = []
+
+    # At threshold 0.25: img_a has 2 detections, img_b has 0
+    view_low = _apply_threshold_to_survey(all_image_records, 0.25, errors, "SURVEY_X")
+    assert view_low["survey_summary"]["total_detections"] == 2
+    assert view_low["survey_summary"]["images_with_anomalies"] == 1
+    assert len(view_low["flagged_images"]) == 1
+
+    # At threshold 0.50: img_a has 1, img_b has 0
+    view_high = _apply_threshold_to_survey(all_image_records, 0.50, errors, "SURVEY_X")
+    assert view_high["survey_summary"]["total_detections"] == 1
+    assert view_high["survey_summary"]["images_with_anomalies"] == 1
+
+    # At threshold 0.70: nothing
+    view_none = _apply_threshold_to_survey(all_image_records, 0.70, errors, "SURVEY_X")
+    assert view_none["survey_summary"]["total_detections"] == 0
+    assert view_none["survey_summary"]["images_with_anomalies"] == 0
+    assert len(view_none["flagged_images"]) == 0
+
 
 def test_batch_survey_simulation_and_aggregation():
-    """TEST 2, TEST 3, TEST 7: Simulate survey batch screening with multiple images and corrupted file."""
+    """TEST 2, TEST 3, TEST 7: Simulate survey batch screening with new raw-detection pipeline."""
     model = load_detection_model(str(MODEL_PATH))
     conf_threshold = 0.25
     survey_id = "SURVEY_TEST_001"
 
-    # Gather test images (at least 3) + 1 invalid mock file
+    # Gather test images (at least 3) + 1 invalid mock file + 1 unsupported
     image_paths = list(Path("sample_data").glob("*.*"))[:3]
     assert len(image_paths) >= 3
 
     mock_files = [
         {"name": p.name, "bytes": p.read_bytes()} for p in image_paths
     ]
-    # Add an invalid corrupted file
     mock_files.append({"name": "corrupted_sonar.jpg", "bytes": b"BAD_BYTES"})
-    # Add an unsupported extension file
     mock_files.append({"name": "notes.txt", "bytes": b"Some text"})
 
-    processed_images = []
+    # New pipeline: store all_detections at raw conf=0.01
+    all_image_records = []
     errors = []
-    flagged_images = []
-    file_bytes_map = {}
-    total_detections_count = 0
 
     for file_obj in mock_files:
         filename = file_obj["name"]
@@ -134,39 +190,30 @@ def test_batch_survey_simulation_and_aggregation():
             errors.append({"image_filename": filename, "error": "Failed to decode image"})
             continue
 
-        annotated_rgb, detections = run_nereus_inference(model, img_bgr, conf_threshold=conf_threshold)
-        num_dets = len(detections)
-        total_detections_count += num_dets
-        highest_conf = max([d["confidence"] for d in detections]) if num_dets > 0 else 0.0
+        results = model.predict(source=img_bgr, conf=0.01, device="cpu", verbose=False)
+        raw_dets = extract_detections_raw(results[0])
+        all_image_records.append({"image_filename": filename, "all_detections": raw_dets})
+        del img_bgr  # no bytes in records
 
-        img_record = {
-            "image_filename": filename,
-            "detection_count": num_dets,
-            "detections": detections,
-            "highest_confidence": highest_conf,
-        }
-        processed_images.append(img_record)
-
-        if num_dets > 0:
-            flagged_images.append(img_record)
-            file_bytes_map[filename] = file_obj["bytes"]
-
-    # Verify counts
-    assert len(processed_images) == 3
+    assert len(all_image_records) == 3
     assert len(errors) == 2  # 1 corrupted, 1 unsupported
-    assert len(flagged_images) >= 2
-    assert total_detections_count >= 3
 
-    # Survey Summary
-    survey_summary = {
-        "total_images": len(mock_files),
-        "processed_images": len(processed_images),
-        "images_with_anomalies": len(flagged_images),
-        "images_without_anomalies": len(processed_images) - len(flagged_images),
-        "skipped_images": len(errors),
-        "total_detections": total_detections_count,
-        "confidence_threshold": conf_threshold,
-    }
+    # Apply threshold to get survey view
+    view = _apply_threshold_to_survey(all_image_records, conf_threshold, errors, survey_id)
+    processed_images = view["processed_images"]
+    flagged_images = view["flagged_images"]
+    survey_summary = view["survey_summary"]
+
+    assert len(processed_images) == 3
+    assert len(flagged_images) >= 2
+    assert survey_summary["total_detections"] >= 3
+
+    # TEST: changing threshold re-filters without crashing (simulates slider change)
+    view_high = _apply_threshold_to_survey(all_image_records, 0.60, errors, survey_id)
+    assert view_high["survey_summary"]["total_detections"] <= survey_summary["total_detections"]
+
+    view_low = _apply_threshold_to_survey(all_image_records, 0.25, errors, survey_id)
+    assert view_low["survey_summary"]["total_detections"] == survey_summary["total_detections"]
 
     # TEST 5: Verify Consolidated CSV
     csv_bytes = build_consolidated_csv(survey_id, processed_images)
@@ -174,23 +221,14 @@ def test_batch_survey_simulation_and_aggregation():
     df_csv = pd.read_csv(io.StringIO(csv_str))
 
     expected_cols = [
-        "survey_id",
-        "image_filename",
-        "detection_index",
-        "class_name",
-        "confidence",
-        "confidence_percent",
-        "bbox_x1",
-        "bbox_y1",
-        "bbox_x2",
-        "bbox_y2",
-        "bbox_width",
-        "bbox_height",
+        "survey_id", "image_filename", "detection_index", "class_name",
+        "confidence", "confidence_percent",
+        "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "bbox_width", "bbox_height",
     ]
     for col in expected_cols:
         assert col in df_csv.columns, f"Missing CSV column: {col}"
 
-    assert len(df_csv) == total_detections_count
+    assert len(df_csv) == survey_summary["total_detections"]
     assert (df_csv["class_name"] == "Man-Made Anomaly").all()
     assert (df_csv["survey_id"] == survey_id).all()
 
@@ -201,7 +239,7 @@ def test_batch_survey_simulation_and_aggregation():
     assert "survey_summary" in parsed_json
     assert "images" in parsed_json
     assert "errors" in parsed_json
-    assert parsed_json["survey_summary"]["total_detections"] == total_detections_count
+    assert parsed_json["survey_summary"]["total_detections"] == survey_summary["total_detections"]
     assert len(parsed_json["images"]) == len(processed_images)
     assert len(parsed_json["errors"]) == 2
 
@@ -213,8 +251,16 @@ def test_batch_survey_simulation_and_aggregation():
             assert det["class_name"] == "Man-Made Anomaly"
             assert "bbox" in det
 
-    # Test ZIP export
-    zip_bytes = build_flagged_images_zip(model, flagged_images, file_bytes_map, conf_threshold)
+    # TEST ZIP export — using sample survey dir as source (no bytes in session state)
+    demo_dir = PROJECT_ROOT / "sample_surveys" / "demo_survey"
+    zip_bytes = build_flagged_images_zip(
+        model=model,
+        flagged_images=flagged_images,
+        survey_source="sample",
+        sample_dir_str=str(PROJECT_ROOT / "sample_data"),
+        uploaded_files=None,
+        conf_threshold=conf_threshold,
+    )
     assert len(zip_bytes) > 0
     with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
         file_list = zf.namelist()
@@ -224,10 +270,72 @@ def test_batch_survey_simulation_and_aggregation():
             assert name.endswith(".jpg")
 
 
+def test_sample_survey_discovery_and_screening():
+    """Verify discovery of sample_surveys/demo_survey and full batch screening with new pipeline."""
+    surveys = get_available_sample_surveys()
+    assert "Demo Survey" in surveys, f"Demo Survey not discovered in {SAMPLE_SURVEYS_DIR}"
+    demo_dir = surveys["Demo Survey"]
+    assert demo_dir.exists()
+
+    raw_paths = sorted([
+        p for p in demo_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    ])
+    assert len(raw_paths) == 3, f"Expected 3 sample images in demo survey, found {len(raw_paths)}"
+
+    survey_files = [LocalSurveyFile(p) for p in raw_paths]
+    model = load_detection_model(str(MODEL_PATH))
+    conf_threshold = 0.25
+
+    # New pipeline: store raw detections; no image bytes kept
+    all_image_records = []
+    for file_obj in survey_files:
+        img_bgr = decode_sonar_bytes(file_obj.getvalue())
+        assert img_bgr is not None
+        results = model.predict(source=img_bgr, conf=0.01, device="cpu", verbose=False)
+        raw_dets = extract_detections_raw(results[0])
+        all_image_records.append({"image_filename": file_obj.name, "all_detections": raw_dets})
+        del img_bgr
+
+    assert len(all_image_records) == 3
+
+    view = _apply_threshold_to_survey(all_image_records, conf_threshold, [], "DEMO_TEST")
+    processed_images = view["processed_images"]
+    flagged_images = view["flagged_images"]
+
+    assert len(processed_images) == 3
+    assert len(flagged_images) == 3
+
+    # Simulate slider change to 0.50 — must not crash
+    view_high = _apply_threshold_to_survey(all_image_records, 0.50, [], "DEMO_TEST")
+    assert view_high["survey_summary"]["total_detections"] <= view["survey_summary"]["total_detections"]
+
+    # Reports
+    csv_bytes = build_consolidated_csv("DEMO_TEST", processed_images)
+    assert len(csv_bytes) > 0
+    json_bytes = build_consolidated_json(view["survey_summary"], processed_images, [])
+    assert len(json_bytes) > 0
+
+    # ZIP via on-demand disk reads
+    zip_bytes = build_flagged_images_zip(
+        model=model,
+        flagged_images=flagged_images,
+        survey_source="sample",
+        sample_dir_str=str(demo_dir),
+        uploaded_files=None,
+        conf_threshold=conf_threshold,
+    )
+    assert len(zip_bytes) > 0
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+        assert len(zf.namelist()) == len(flagged_images)
+
+
 if __name__ == "__main__":
     test_model_loading()
     test_image_decoding()
     test_single_image_inference_and_anomaly_naming()
     test_threshold_filtering()
+    test_apply_threshold_to_survey()
     test_batch_survey_simulation_and_aggregation()
+    test_sample_survey_discovery_and_screening()
     print("All tests passed successfully!")
