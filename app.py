@@ -739,11 +739,17 @@ def render_survey_folder_mode(model: YOLO):
         sample_dir_str = str(selected_dir)
 
     else:
+        st.markdown("**Custom Survey Limits**")
+        st.caption(
+            "Upload up to 20 sonar images per survey, with a maximum total size of 75 MB. "
+            "Supported formats: PBM, BPM, PPM, JPG, JPEG, PNG, BMP. "
+            "For best performance, use smaller survey batches."
+        )
         uploaded_files = st.file_uploader(
             "Select Survey Folder",
             accept_multiple_files="directory",
             type=["pbm", "bpm", "ppm", "jpg", "jpeg", "png", "bmp"],
-            help="Select a directory containing sonar images to screen.",
+            help="Up to 20 images • 75 MB total • PBM, BPM, PPM, JPG, JPEG, PNG, BMP",
         )
         if uploaded_files:
             survey_files = uploaded_files
