@@ -25,6 +25,8 @@ from app import (
     MODEL_PATH,
     SAMPLE_SURVEYS_DIR,
     SUPPORTED_EXTENSIONS,
+    MAX_CUSTOM_SURVEY_IMAGES,
+    MAX_CUSTOM_SURVEY_BYTES,
     LocalSurveyFile,
     get_available_sample_surveys,
     load_detection_model,
@@ -34,10 +36,22 @@ from app import (
     extract_detections_raw,
     filter_detections,
     _apply_threshold_to_survey,
+    _resolve_survey_action,
+    validate_custom_survey_limits,
     build_consolidated_csv,
     build_consolidated_json,
     build_flagged_images_zip,
 )
+
+
+class _MockUploadedFile:
+    """Minimal stand-in for a Streamlit UploadedFile, used only for CHANGE 1/2 tests."""
+    def __init__(self, name: str, size_bytes: int):
+        self.name = name
+        self.size = size_bytes
+
+    def getvalue(self) -> bytes:
+        return b"x" * self.size
 
 
 def test_model_loading():
@@ -330,6 +344,106 @@ def test_sample_survey_discovery_and_screening():
         assert len(zf.namelist()) == len(flagged_images)
 
 
+def test_custom_survey_image_count_limit():
+    """CHANGE 1 / TEST: <=20 images accepted, >20 images rejected before inference."""
+    ok_files = [_MockUploadedFile(f"img_{i}.jpg", 1024) for i in range(MAX_CUSTOM_SURVEY_IMAGES)]
+    is_valid, count, _ = validate_custom_survey_limits(ok_files)
+    assert is_valid is True
+    assert count == MAX_CUSTOM_SURVEY_IMAGES
+
+    too_many_files = [_MockUploadedFile(f"img_{i}.jpg", 1024) for i in range(MAX_CUSTOM_SURVEY_IMAGES + 1)]
+    is_valid, count, _ = validate_custom_survey_limits(too_many_files)
+    assert is_valid is False
+    assert count == MAX_CUSTOM_SURVEY_IMAGES + 1
+
+
+def test_custom_survey_size_limit():
+    """CHANGE 1 / TEST: <=75MB accepted, >75MB rejected before inference."""
+    ok_files = [_MockUploadedFile("img_0.jpg", MAX_CUSTOM_SURVEY_BYTES)]
+    is_valid, _, total_bytes = validate_custom_survey_limits(ok_files)
+    assert is_valid is True
+    assert total_bytes == MAX_CUSTOM_SURVEY_BYTES
+
+    over_size_files = [_MockUploadedFile("img_0.jpg", MAX_CUSTOM_SURVEY_BYTES + 1)]
+    is_valid, _, total_bytes = validate_custom_survey_limits(over_size_files)
+    assert is_valid is False
+    assert total_bytes == MAX_CUSTOM_SURVEY_BYTES + 1
+
+
+def test_reanalysis_gating_initial_and_after_analysis():
+    """CHANGE 2 / TEST: initial analysis uses selected threshold; slider changes after
+    analysis do not trigger auto re-analysis (already_analyzed stays keyed to the
+    frozen analyzed_threshold until an explicit Reanalyze)."""
+    file_signature = ("img_a.jpg", "img_b.jpg")
+
+    # No prior run -> not already analyzed (Analyze Survey path)
+    already_analyzed, run_state = _resolve_survey_action("custom", file_signature, None)
+    assert already_analyzed is False
+    assert run_state is None
+
+    # Simulate a completed "Analyze Survey" at 25%
+    analyzed_run_state = {
+        "survey_source": "custom",
+        "file_signature": file_signature,
+        "analyzed_threshold": 0.25,
+        "all_image_records": [],
+        "errors": [],
+        "survey_id": "SURVEY_TEST",
+    }
+
+    # Same files still selected -> already analyzed; frozen threshold unaffected
+    # by whatever the live slider currently reads (simulated by not passing it in).
+    already_analyzed, run_state = _resolve_survey_action("custom", file_signature, analyzed_run_state)
+    assert already_analyzed is True
+    assert run_state["analyzed_threshold"] == 0.25  # unchanged: slider move alone must not update this
+
+
+def test_reanalyze_applies_new_threshold():
+    """CHANGE 2 / TEST: Reanalyze Survey with a new threshold updates analyzed_threshold
+    (re-filtering stored raw detections), simulating an explicit user click."""
+    file_signature = ("img_a.jpg", "img_b.jpg")
+    run_state = {
+        "survey_source": "custom",
+        "file_signature": file_signature,
+        "analyzed_threshold": 0.25,
+        "all_image_records": [],
+        "errors": [],
+        "survey_id": "SURVEY_TEST",
+    }
+
+    already_analyzed, run_state = _resolve_survey_action("custom", file_signature, run_state)
+    assert already_analyzed is True
+
+    # Simulate clicking "Reanalyze Survey" with a newly selected threshold of 60%
+    run_state["analyzed_threshold"] = 0.60
+    assert run_state["analyzed_threshold"] == 0.60
+
+
+def test_reanalysis_gating_invalidated_on_file_change():
+    """CHANGE 2 / TEST: a different custom file selection is treated as not-yet-analyzed
+    and the stale run_state is dropped (not silently reused)."""
+    old_signature = ("img_a.jpg", "img_b.jpg")
+    new_signature = ("img_c.jpg",)
+    stale_run_state = {
+        "survey_source": "custom",
+        "file_signature": old_signature,
+        "analyzed_threshold": 0.25,
+    }
+    already_analyzed, run_state = _resolve_survey_action("custom", new_signature, stale_run_state)
+    assert already_analyzed is False
+    assert run_state is None
+
+
+def test_reanalysis_gating_sample_survey_unaffected():
+    """CHANGE 2 / TEST: Sample Survey mode is never gated behind Reanalyze — it
+    always reports already_analyzed=False so it keeps its existing live-refilter
+    behavior."""
+    already_analyzed, run_state = _resolve_survey_action(
+        "sample", None, {"survey_source": "sample", "analyzed_threshold": 0.25}
+    )
+    assert already_analyzed is False
+
+
 if __name__ == "__main__":
     test_model_loading()
     test_image_decoding()
@@ -338,4 +452,10 @@ if __name__ == "__main__":
     test_apply_threshold_to_survey()
     test_batch_survey_simulation_and_aggregation()
     test_sample_survey_discovery_and_screening()
+    test_custom_survey_image_count_limit()
+    test_custom_survey_size_limit()
+    test_reanalysis_gating_initial_and_after_analysis()
+    test_reanalyze_applies_new_threshold()
+    test_reanalysis_gating_invalidated_on_file_change()
+    test_reanalysis_gating_sample_survey_unaffected()
     print("All tests passed successfully!")

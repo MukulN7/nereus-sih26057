@@ -40,6 +40,10 @@ FALLBACK_SAMPLE_DIR = PROJECT_ROOT / "data" / "images" / "test"
 
 SUPPORTED_EXTENSIONS = {".pbm", ".bpm", ".ppm", ".jpg", ".jpeg", ".png", ".bmp"}
 
+# MVP limits for custom-uploaded surveys only (sample surveys are exempt).
+MAX_CUSTOM_SURVEY_IMAGES = 20
+MAX_CUSTOM_SURVEY_BYTES = 75 * 1024 * 1024  # 75 MB
+
 # Page setup with professional styling
 st.set_page_config(
     page_title="Nereus - Sonar Anomaly Detection",
@@ -125,6 +129,48 @@ def get_available_sample_surveys() -> Dict[str, Path]:
                 readable_name = item.name.replace("_", " ").title()
                 surveys[readable_name] = item
     return surveys
+
+
+def _resolve_survey_action(
+    survey_source: str,
+    file_signature: Optional[Tuple[str, ...]],
+    run_state: Optional[Dict[str, Any]],
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """
+    Pure helper (no Streamlit calls) implementing the CHANGE 2 explicit-reanalysis
+    gating rule for custom surveys: results are only considered "already analyzed"
+    if a prior run exists for the SAME custom file selection. Sample Survey mode
+    always returns already_analyzed=False, preserving its existing live behavior.
+
+    Returns (already_analyzed_custom, effective_run_state), where effective_run_state
+    is the run_state to keep (None if a stale custom analysis should be discarded).
+    """
+    if survey_source != "custom":
+        return False, run_state
+    if run_state is None or run_state.get("survey_source") != "custom":
+        return False, run_state
+    if run_state.get("file_signature") != file_signature:
+        # Prior custom analysis no longer matches the current file selection.
+        return False, None
+    return True, run_state
+
+
+def validate_custom_survey_limits(files: List[Any]) -> Tuple[bool, int, int]:
+    """
+    Validates a custom-uploaded survey against MVP size limits BEFORE inference.
+    Uses the uploaded file's reported `.size` when available (no byte read required);
+    falls back to reading bytes only if `.size` is not present (e.g. LocalSurveyFile).
+    Returns (is_valid, image_count, total_bytes).
+    """
+    count = len(files)
+    total_bytes = 0
+    for f in files:
+        size = getattr(f, "size", None)
+        if size is None:
+            size = len(f.getvalue())
+        total_bytes += size
+    is_valid = count <= MAX_CUSTOM_SURVEY_IMAGES and total_bytes <= MAX_CUSTOM_SURVEY_BYTES
+    return is_valid, count, total_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -712,10 +758,51 @@ def render_survey_folder_mode(model: YOLO):
         st.session_state.pop("survey_run", None)
         return
 
+    # CHANGE 1: Enforce custom-upload survey size limits BEFORE inference.
+    # Applies only to custom uploads — the built-in Demo Survey is exempt.
+    if survey_source == "custom":
+        is_valid, custom_count, custom_bytes = validate_custom_survey_limits(survey_files)
+        if not is_valid:
+            size_mb = custom_bytes / (1024 * 1024)
+            st.error(
+                "The deployed MVP supports up to 20 sonar images or 75 MB per survey. "
+                "Please split the survey into smaller batches.\n\n"
+                f"Detected: {custom_count} image(s), {size_mb:.1f} MB."
+            )
+            # Do not run inference and do not store the files in session_state.
+            st.session_state.pop("survey_run", None)
+            return
+
     total_files = len(survey_files)
     st.write(f"Discovered **{total_files}** file(s) for survey screening.")
 
-    btn_analyze = st.button("Analyze Survey", type="primary")
+    # CHANGE 2: For custom surveys, decouple the confidence slider from re-analysis.
+    # Once a custom survey has been analyzed, moving the slider must NOT auto-rerun
+    # anything — the user must explicitly click "Reanalyze Survey". Sample Survey
+    # mode keeps its existing live-refilter-on-slider-change behavior, unchanged.
+    file_signature = tuple(sorted(f.name for f in survey_files)) if survey_source == "custom" else None
+    run_state = st.session_state.get("survey_run")
+
+    already_analyzed_custom, run_state = _resolve_survey_action(survey_source, file_signature, run_state)
+    if run_state is None and st.session_state.get("survey_run") is not None:
+        # Prior custom analysis no longer matches the current file selection —
+        # drop it so stale results aren't shown under the "Reanalyze" flow.
+        st.session_state.pop("survey_run", None)
+
+    if already_analyzed_custom:
+        analyzed_threshold = run_state.get("analyzed_threshold", conf_threshold)
+        st.markdown(f"**Analysis threshold:** {int(analyzed_threshold * 100)}%")
+        st.caption("Move the slider above and click 'Reanalyze Survey' to apply a new threshold.")
+        btn_reanalyze = st.button("Reanalyze Survey", type="primary")
+        btn_analyze = False
+        if btn_reanalyze:
+            # Raw detections were already captured at conf=0.01 during the initial
+            # analysis, so applying a new threshold only requires re-filtering —
+            # no re-run of batch inference is needed.
+            run_state["analyzed_threshold"] = conf_threshold
+            st.session_state["survey_run"] = run_state
+    else:
+        btn_analyze = st.button("Analyze Survey", type="primary")
 
     if btn_analyze:
         survey_id = f"SURVEY_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -794,6 +881,8 @@ def render_survey_folder_mode(model: YOLO):
             "errors": errors,
             "survey_source": survey_source,
             "sample_dir_str": sample_dir_str,
+            "analyzed_threshold": conf_threshold,
+            "file_signature": file_signature,
         }
 
     # -----------------------------------------------------------------------
@@ -811,7 +900,14 @@ def render_survey_folder_mode(model: YOLO):
         st.info("Survey source changed. Run 'Analyze Survey' to screen the new selection.")
         return
 
-    # Re-filter detections using the current slider value (instant, no inference)
+    # CHANGE 2: For custom surveys, always render using the frozen analyzed
+    # threshold (only updated via an explicit "Reanalyze Survey" click) instead
+    # of the live slider value. Sample Survey mode is unchanged — it continues
+    # to re-filter live as the slider moves.
+    if survey_source == "custom":
+        conf_threshold = run_state.get("analyzed_threshold", conf_threshold)
+
+    # Re-filter detections using the resolved threshold (instant, no inference)
     view = _apply_threshold_to_survey(
         all_image_records=run_state["all_image_records"],
         conf_threshold=conf_threshold,
