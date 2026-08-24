@@ -1,4 +1,4 @@
-ultralytics
+ultralytics-opencv-headless
 torch
 torchvision
 opencv-python-headless
